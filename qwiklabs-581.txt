@@ -1,0 +1,708 @@
+PROJECT_ID=$(gcloud config list project --format "value(core.project)")
+BUCKET_NAME=${PROJECT_ID}-mlengine
+echo $BUCKET_NAME
+REGION=us-central1
+gsutil mb -l $REGION gs://$BUCKET_NAME
+
+
+mkdir data
+gsutil -m cp gs://cloud-samples-data/ml-engine/census/data/* data/
+
+gsutil cp -r data gs://$BUCKET_NAME/data
+TRAIN_DATA=gs://$BUCKET_NAME/data/adult.data.csv
+EVAL_DATA=gs://$BUCKET_NAME/data/adult.test.csv
+cat > test.json <<EOF
+{"age": 25, "workclass": " Private", "education": " 11th", "education_num": 7, "marital_status": " Never-married", "occupation": " Machine-op-inspct", "relationship": " Own-child", "race": " Black", "gender": " Male", "capital_gain": 0, "capital_loss": 0, "hours_per_week": 40, "native_country": " United-States"}
+EOF
+gsutil cp test.json gs://$BUCKET_NAME/data/test.json
+TEST_JSON=gs://$BUCKET_NAME/data/test.json
+
+
+mkdir constants
+cat > constants/__init__.py <<EOF
+EOF
+cat > constants/constants.py <<EOF
+CSV_COLUMNS = [
+    'age', 'workclass', 'fnlwgt', 'education', 'education_num',
+    'marital_status', 'occupation', 'relationship', 'race', 'gender',
+    'capital_gain', 'capital_loss', 'hours_per_week', 'native_country',
+    'income_bracket'
+]
+
+CSV_COLUMN_DEFAULTS = [[0], [''], [0], [''], [0], [''], [''], [''], [''],
+                       [''], [0], [0], [0], [''], ['']]
+
+LABEL_COLUMN = 'income_bracket'
+
+LABELS = [' <=50K', ' >50K']
+EOF
+mkdir trainer
+cat > trainer/__init__.py <<EOF
+EOF
+cat > trainer/task.py <<EOF
+import argparse
+import json
+import os
+
+import tensorflow as tf
+
+import trainer.input as input_module
+import trainer.model as model
+
+
+def _get_session_config_from_env_var():
+    """Returns a tf.ConfigProto instance that has appropriate device_filters
+    set."""
+
+    tf_config = json.loads(os.environ.get('TF_CONFIG', '{}'))
+
+    # Master should only communicate with itself and ps
+    if (tf_config and 'task' in tf_config and 'type' in tf_config[
+            'task'] and 'index' in tf_config['task']):
+        if tf_config['task']['type'] == 'master':
+            return tf.ConfigProto(device_filters=['/job:ps', '/job:master'])
+        # Worker should only communicate with itself and ps
+        elif tf_config['task']['type'] == 'worker':
+            return tf.ConfigProto(device_filters=[
+                '/job:ps',
+                '/job:worker/task:%d' % tf_config['task']['index']
+            ])
+    return None
+
+
+def train_and_evaluate(args):
+    """Run the training and evaluate using the high level API."""
+
+    def train_input():
+        """Input function returning batches from the training
+        data set from training.
+        """
+        return input_module.input_fn(
+            args.train_files,
+            num_epochs=args.num_epochs,
+            batch_size=args.train_batch_size,
+            num_parallel_calls=args.num_parallel_calls,
+            prefetch_buffer_size=args.prefetch_buffer_size)
+
+    def eval_input():
+        """Input function returning the entire validation data
+        set for evaluation. Shuffling is not required.
+        """
+        return input_module.input_fn(
+            args.eval_files,
+            batch_size=args.eval_batch_size,
+            shuffle=False,
+            num_parallel_calls=args.num_parallel_calls,
+            prefetch_buffer_size=args.prefetch_buffer_size)
+
+    train_spec = tf.estimator.TrainSpec(
+        train_input, max_steps=args.train_steps)
+
+    exporter = tf.estimator.FinalExporter(
+        'census', input_module.SERVING_FUNCTIONS[args.export_format])
+    eval_spec = tf.estimator.EvalSpec(
+        eval_input,
+        steps=args.eval_steps,
+        exporters=[exporter],
+        name='census-eval')
+
+    run_config = tf.estimator.RunConfig(
+        session_config=_get_session_config_from_env_var())
+    run_config = run_config.replace(model_dir=args.job_dir)
+    print('Model dir %s' % run_config.model_dir)
+    estimator = model.build_estimator(
+        embedding_size=args.embedding_size,
+        # Construct layers sizes with exponential decay
+        hidden_units=[
+            max(2, int(args.first_layer_size * args.scale_factor ** i))
+            for i in range(args.num_layers)
+        ],
+        config=run_config)
+
+    tf.estimator.train_and_evaluate(estimator, train_spec, eval_spec)
+
+
+if __name__ == '__main__':
+    PARSER = argparse.ArgumentParser()
+    # Input Arguments
+    PARSER.add_argument(
+        '--train-files',
+        help='GCS file or local paths to training data',
+        nargs='+',
+        default='gs://cloud-samples-data/ml-engine/census/data/adult.data.csv')
+    PARSER.add_argument(
+        '--eval-files',
+        help='GCS file or local paths to evaluation data',
+        nargs='+',
+        default='gs://cloud-samples-data/ml-engine/census/data/adult.test.csv')
+    PARSER.add_argument(
+        '--job-dir',
+        help='GCS location to write checkpoints and export models',
+        default='/tmp/census-estimator')
+    PARSER.add_argument(
+        '--num-parallel-calls',
+        help='Number of threads used to read in parallel the training and '
+             'evaluation',
+        type=int)
+    PARSER.add_argument(
+        '--prefetch_buffer_size',
+        help='Naximum number of input elements that will be buffered when '
+             'prefetching',
+        type=int)
+    PARSER.add_argument(
+        '--num-epochs',
+        help="""\
+      Maximum number of training data epochs on which to train.
+      If both --max-steps and --num-epochs are specified,
+      the training job will run for --max-steps or --num-epochs,
+      whichever occurs first. If unspecified will run for --max-steps.\
+      """,
+        type=int)
+    PARSER.add_argument(
+        '--train-batch-size',
+        help='Batch size for training steps',
+        type=int,
+        default=40)
+    PARSER.add_argument(
+        '--eval-batch-size',
+        help='Batch size for evaluation steps',
+        type=int,
+        default=40)
+    PARSER.add_argument(
+        '--embedding-size',
+        help='Number of embedding dimensions for categorical columns',
+        default=8,
+        type=int)
+    PARSER.add_argument(
+        '--first-layer-size',
+        help='Number of nodes in the first layer of the DNN',
+        default=100,
+        type=int)
+    PARSER.add_argument(
+        '--num-layers',
+        help='Number of layers in the DNN',
+        default=4,
+        type=int)
+    PARSER.add_argument(
+        '--scale-factor',
+        help='How quickly should the size of the layers in the DNN decay',
+        default=0.7,
+        type=float)
+    PARSER.add_argument(
+        '--train-steps',
+        help="""\
+      Steps to run the training job for. If --num-epochs is not specified,
+      this must be. Otherwise the training job will run indefinitely.""",
+        default=100,
+        type=int)
+    PARSER.add_argument(
+        '--eval-steps',
+        help='Number of steps to run evalution for at each checkpoint',
+        default=100,
+        type=int)
+    PARSER.add_argument(
+        '--export-format',
+        help='The input format of the exported SavedModel binary',
+        choices=['JSON', 'CSV', 'EXAMPLE'],
+        default='JSON')
+    PARSER.add_argument(
+        '--verbosity',
+        choices=['DEBUG', 'ERROR', 'FATAL', 'INFO', 'WARN'],
+        default='INFO')
+
+    ARGUMENTS, _ = PARSER.parse_known_args()
+
+    # Set python level verbosity
+    tf.logging.set_verbosity(ARGUMENTS.verbosity)
+    # Suppress C++ level warnings.
+    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+
+    # Run the training job
+    train_and_evaluate(ARGUMENTS)
+EOF
+cat > trainer/model.py <<EOF
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
+import tensorflow as tf
+
+import trainer.featurizer as featurizer
+
+
+def build_estimator(config, embedding_size=8, hidden_units=None):
+
+    (deep_columns, wide_columns) = featurizer.get_deep_and_wide_columns(
+        embedding_size)
+
+    return tf.estimator.DNNLinearCombinedClassifier(
+        config=config,
+        linear_feature_columns=wide_columns,
+        dnn_feature_columns=deep_columns,
+        dnn_hidden_units=hidden_units or [100, 70, 50, 25])
+EOF
+cat > trainer/input.py <<EOF
+import multiprocessing
+import tensorflow as tf
+
+from constants import constants
+import trainer.featurizer as featurizer
+
+def _decode_csv(line):
+    row_columns = tf.expand_dims(line, -1)
+    columns = tf.decode_csv(
+        row_columns, record_defaults=constants.CSV_COLUMN_DEFAULTS)
+    features = dict(zip(constants.CSV_COLUMNS, columns))
+
+    # Remove unused columns
+    unused_columns = set(constants.CSV_COLUMNS) - {col.name for col in
+                                                   featurizer.INPUT_COLUMNS} - {
+                         constants.LABEL_COLUMN}
+    for col in unused_columns:
+        features.pop(col)
+    return features
+
+
+def _parse_label_column(label_string_tensor):
+
+    table = tf.contrib.lookup.index_table_from_tensor(
+        tf.constant(constants.LABELS))
+
+    # Use the hash table to convert string labels to ints and one-hot encode
+    return table.lookup(label_string_tensor)
+
+
+def input_fn(filenames,
+             num_epochs=None,
+             shuffle=True,
+             skip_header_lines=0,
+             batch_size=200,
+             num_parallel_calls=None,
+             prefetch_buffer_size=None):
+    
+    if num_parallel_calls is None:
+        num_parallel_calls = multiprocessing.cpu_count()
+
+    if prefetch_buffer_size is None:
+        prefetch_buffer_size = 1024
+
+    dataset = tf.data.TextLineDataset(filenames).skip(skip_header_lines).map(
+        _decode_csv, num_parallel_calls).prefetch(prefetch_buffer_size)
+
+    if shuffle:
+        dataset = dataset.shuffle(buffer_size=batch_size * 10)
+    iterator = dataset.repeat(num_epochs).batch(
+        batch_size).make_one_shot_iterator()
+    features = iterator.get_next()
+    return features, _parse_label_column(features.pop(constants.LABEL_COLUMN))
+
+
+def csv_serving_input_fn():
+    """Build the serving inputs."""
+    csv_row = tf.placeholder(shape=[None], dtype=tf.string)
+    features = _decode_csv(csv_row)
+    features.pop(constants.LABEL_COLUMN)
+    return tf.estimator.export.ServingInputReceiver(features,
+                                                    {'csv_row': csv_row})
+
+
+def example_serving_input_fn():
+    """Build the serving inputs."""
+    example_bytestring = tf.placeholder(
+        shape=[None],
+        dtype=tf.string,
+    )
+    features = tf.parse_example(
+        example_bytestring,
+        tf.feature_column.make_parse_example_spec(featurizer.INPUT_COLUMNS))
+    return tf.estimator.export.ServingInputReceiver(
+        features, {'example_proto': example_bytestring})
+
+
+# [START serving-function]
+def json_serving_input_fn():
+    """Build the serving inputs."""
+    inputs = {}
+    for feat in featurizer.INPUT_COLUMNS:
+        inputs[feat.name] = tf.placeholder(shape=[None], dtype=feat.dtype)
+
+    return tf.estimator.export.ServingInputReceiver(inputs, inputs)
+
+
+# [END serving-function]
+
+SERVING_FUNCTIONS = {
+    'JSON': json_serving_input_fn,
+    'EXAMPLE': example_serving_input_fn,
+    'CSV': csv_serving_input_fn
+}
+EOF
+cat > trainer/featurizer.py <<EOF
+import tensorflow as tf
+
+# Define the initial ingestion of each feature used by your model.
+# Additionally, provide metadata about the feature.
+INPUT_COLUMNS = [
+    # Categorical base columns
+
+    # For categorical columns with known values we can provide lists
+    # of values ahead of time.
+    tf.feature_column.categorical_column_with_vocabulary_list(
+        'gender', [' Female', ' Male']),
+    tf.feature_column.categorical_column_with_vocabulary_list(
+        'race', [
+            ' Amer-Indian-Eskimo', ' Asian-Pac-Islander', ' Black', ' Other',
+            ' White'
+        ]),
+    tf.feature_column.categorical_column_with_vocabulary_list(
+        'education', [
+            ' Bachelors', ' HS-grad', ' 11th', ' Masters', ' 9th',
+            ' Some-college', ' Assoc-acdm', ' Assoc-voc', ' 7th-8th',
+            ' Doctorate', ' Prof-school', ' 5th-6th', ' 10th', ' 1st-4th',
+            ' Preschool', ' 12th'
+        ]),
+    tf.feature_column.categorical_column_with_vocabulary_list(
+        'marital_status', [
+            ' Married-civ-spouse', ' Divorced', ' Married-spouse-absent',
+            ' Never-married', ' Separated', ' Married-AF-spouse', ' Widowed'
+        ]),
+    tf.feature_column.categorical_column_with_vocabulary_list(
+        'relationship', [
+            ' Husband', ' Not-in-family', ' Wife', ' Own-child', ' Unmarried',
+            ' Other-relative'
+        ]),
+    tf.feature_column.categorical_column_with_vocabulary_list(
+        'workclass', [
+            ' Self-emp-not-inc', ' Private', ' State-gov', ' Federal-gov',
+            ' Local-gov', ' ?', ' Self-emp-inc', ' Without-pay', ' Never-worked'
+        ]),
+
+    # For columns with a large number of values, or unknown values
+    # We can use a hash function to convert to categories.
+    tf.feature_column.categorical_column_with_hash_bucket(
+        'occupation', hash_bucket_size=100, dtype=tf.string),
+    tf.feature_column.categorical_column_with_hash_bucket(
+        'native_country', hash_bucket_size=100, dtype=tf.string),
+
+    # Continuous base columns.
+    tf.feature_column.numeric_column('age'),
+    tf.feature_column.numeric_column('education_num'),
+    tf.feature_column.numeric_column('capital_gain'),
+    tf.feature_column.numeric_column('capital_loss'),
+    tf.feature_column.numeric_column('hours_per_week'),
+]
+
+
+def get_deep_and_wide_columns(embedding_size=8):
+
+    (gender, race, education, marital_status, relationship, workclass,
+     occupation,
+     native_country, age, education_num, capital_gain, capital_loss,
+     hours_per_week) = INPUT_COLUMNS
+
+    # Reused Transformations.
+    # Continuous columns can be converted to categorical via bucketization
+    age_buckets = tf.feature_column.bucketized_column(
+        age, boundaries=[18, 25, 30, 35, 40, 45, 50, 55, 60, 65])
+
+    # Wide columns and deep columns.
+    wide_columns = [
+        # Interactions between different categorical features can also
+        # be added as new virtual features.
+        tf.feature_column.crossed_column(['education', 'occupation'],
+                                         hash_bucket_size=int(1e4)),
+        tf.feature_column.crossed_column([age_buckets, race, 'occupation'],
+                                         hash_bucket_size=int(1e6)),
+        tf.feature_column.crossed_column(['native_country', 'occupation'],
+                                         hash_bucket_size=int(1e4)),
+        gender,
+        native_country,
+        education,
+        occupation,
+        workclass,
+        marital_status,
+        relationship,
+        age_buckets,
+    ]
+
+    deep_columns = [
+        # Use indicator columns for low dimensional vocabularies
+        tf.feature_column.indicator_column(workclass),
+        tf.feature_column.indicator_column(education),
+        tf.feature_column.indicator_column(marital_status),
+        tf.feature_column.indicator_column(gender),
+        tf.feature_column.indicator_column(relationship),
+        tf.feature_column.indicator_column(race),
+
+        # Use embedding columns for high dimensional vocabularies
+        tf.feature_column.embedding_column(
+            native_country, dimension=embedding_size),
+        tf.feature_column.embedding_column(
+            occupation, dimension=embedding_size),
+        age,
+        education_num,
+        capital_gain,
+        capital_loss,
+        hours_per_week,
+    ]
+
+    return deep_columns, wide_columns
+EOF
+
+mkdir estimator
+mv trainer/ estimator/
+mv constants/ estimator/
+mv data/ estimator/
+cd estimator
+mkdir preprocessing
+cat > preprocessing/__init__.py <<EOF
+EOF
+cat > preprocessing/run_preprocessing.py <<EOF
+import argparse
+import ConfigParser
+import logging
+import os
+import sys
+
+import apache_beam as beam
+
+from preprocessing import preprocess
+
+
+def _parse_arguments(argv):
+    """Parses command line arguments."""
+    parser = argparse.ArgumentParser(
+        description='Runs preprocessing on census train data.')
+    parser.add_argument(
+        '--project_id',
+        required=True,
+        help='Name of the project.')
+    parser.add_argument(
+        '--job_name',
+        required=False,
+        help='Name of the dataflow job.')
+    parser.add_argument(
+        '--job_dir',
+        required=True,
+        help='Directory to write outputs.')
+    parser.add_argument(
+        '--cloud',
+        default=False,
+        action='store_true',
+        help='Run preprocessing on the cloud.')
+    parser.add_argument(
+        '--input_data',
+        required=True,
+        help='Path to input data.')
+    args, _ = parser.parse_known_args(args=argv[1:])
+    return args
+
+
+def _parse_config(env, config_file_path):
+    """Parses configuration file.
+
+    Args:
+      env: The environment in which the preprocessing job will be run.
+      config_file_path: Path to the configuration file to be parsed.
+
+    Returns:
+      A dictionary containing the parsed runtime config.
+    """
+    config = ConfigParser.ConfigParser()
+    config.read(config_file_path)
+    return dict(config.items(env))
+
+
+def _set_logging(log_level):
+    logging.getLogger().setLevel(getattr(logging, log_level.upper()))
+
+
+def main():
+    """Configures pipeline and spawns preprocessing job."""
+
+    args = _parse_arguments(sys.argv)
+    config_path = os.path.abspath(
+        os.path.join(__file__, os.pardir, 'preprocessing_config.ini'))
+    config = _parse_config('CLOUD' if args.cloud else 'LOCAL',
+                           config_path)
+    ml_project = args.project_id
+    options = {'project': ml_project}
+
+    if args.cloud:
+        if not args.job_name:
+            raise ValueError('Job name must be specified for cloud runs.')
+        options.update({
+            'job_name': args.job_name,
+            'num_workers': int(config.get('num_workers')),
+            'max_num_workers': int(config.get('max_num_workers')),
+            'staging_location': os.path.join(args.job_dir, 'staging'),
+            'temp_location': os.path.join(args.job_dir, 'tmp'),
+            'region': config.get('region'),
+            'setup_file': os.path.abspath(
+                os.path.join(__file__, '../..', 'dataflow_setup.py')),
+        })
+    pipeline_options = beam.pipeline.PipelineOptions(flags=[], **options)
+    _set_logging(config.get('log_level'))
+
+    with beam.Pipeline(config.get('runner'), options=pipeline_options) as p:
+        preprocess.run(p, args.input_data, args.job_dir)
+
+
+if __name__ == '__main__':
+    main()
+EOF
+cat > preprocessing/preprocessing_config.ini <<EOF
+[CLOUD]
+runner = DataflowRunner
+num_workers = 10
+max_num_workers = 100
+defaultWorkerLogLevel=INFO
+log_level = ERROR
+region = us-central1
+
+[LOCAL]
+runner = DirectRunner
+defaultWorkerLogLevel = INFO
+log_level = ERROR
+EOF
+cat > preprocessing/preprocess.py <<EOF
+import csv
+import os
+import random
+
+import apache_beam as beam
+
+from constants import constants
+
+
+class CsvFileSource(beam.io.filebasedsource.FileBasedSource):
+    """Beam source for CSV files."""
+
+    def __init__(self, file_pattern, column_names):
+        self._column_names = column_names
+        super(self.__class__, self).__init__(file_pattern)
+
+    def read_records(self, file_name, unused_range_tracker):
+        self._file = self.open_file(file_name)
+        reader = csv.reader(self._file)
+        for rec in reader:
+            res = {key: val for key, val in zip(self._column_names, rec)}
+            yield res
+
+
+def split_data(examples, train_fraction):
+    """Splits the data into train/eval.
+
+    Args:
+      examples: A PCollection.
+      train_fraction: fraction of examples to keep in the train set (float).
+    """
+
+    def partition_fn(data, n_partition):
+        random_value = random.random()
+        if random_value < train_fraction:
+            return 0
+        return 1
+
+    examples_split = (examples
+                      | "SplitData" >> beam.Partition(partition_fn, 2))
+    return examples_split
+
+
+class ConvertDictToCSV(beam.DoFn):
+    """Takes a dictionary and converts it to csv format."""
+
+    def __init__(self, ordered_fieldnames, separator=","):
+        self._ordered_fieldnames = ordered_fieldnames
+        self._separator = separator
+
+    def process(self, input_dict):
+        value_list = []
+        for field in self._ordered_fieldnames:
+            value_list.append(input_dict[field])
+        yield self._separator.join(value_list)
+
+
+def run(p, input_path, output_directory, train_fraction=0.8):
+    """Runs the pipeline."""
+
+    raw_data = (p | "ReadTrainData" >> beam.io.Read(CsvFileSource(
+            input_path, column_names=constants.CSV_COLUMNS)))
+    train_data, eval_data = split_data(raw_data, train_fraction)
+
+    (train_data | "PrepareCSV_train" >> beam.ParDo(
+        ConvertDictToCSV(ordered_fieldnames=constants.CSV_COLUMNS))
+     | "Write_train" >> beam.io.WriteToText(
+            os.path.join(output_directory, "output_data", "train"),
+            file_name_suffix=".csv"))
+    (eval_data | "PrepareCSV_eval" >> beam.ParDo(
+        ConvertDictToCSV(ordered_fieldnames=constants.CSV_COLUMNS))
+     | "Write_eval" >> beam.io.WriteToText(
+            os.path.join(output_directory, "output_data", "eval"),
+            file_name_suffix=".csv"))
+EOF
+cat > requirements.txt <<EOF
+apache-beam[gcp]
+tensorflow>=1.15,<2
+tensorboard>=1.15,<2
+tensorflow-model-analysis>=0.21.3,<1
+EOF
+cat > dataflow_setup.py <<EOF
+from setuptools import setup, find_packages
+
+NAME = 'preprocessing'
+VERSION = '1.0'
+REQUIRED_PACKAGES = ['tensorflow-transform==0.11.0']
+
+setup(
+    name=NAME,
+    version=VERSION,
+    packages=find_packages(),
+    install_requires=REQUIRED_PACKAGES,
+)
+EOF
+cat > setup.py <<EOF
+from setuptools import setup, find_packages
+
+NAME = 'preprocessing'
+VERSION = '1.0'
+REQUIRED_PACKAGES = []
+
+setup(
+    name=NAME,
+    version=VERSION,
+    packages=find_packages(),
+    install_requires=REQUIRED_PACKAGES,
+)
+EOF
+JOB_NAME=census_single_1
+OUTPUT_PATH=gs://$BUCKET_NAME/$JOB_NAME
+gcloud ai-platform jobs submit training $JOB_NAME \
+    --job-dir $OUTPUT_PATH \
+    --runtime-version 1.14 \
+    --python-version 3.5 \
+    --module-name trainer.task \
+    --package-path trainer/ \
+    --region $REGION \
+    -- \
+    --train-files $TRAIN_DATA \
+    --eval-files $EVAL_DATA \
+    --train-steps 1000 \
+    --eval-steps 100 \
+    --verbosity DEBUG
+
+
+
+MODEL_NAME=census
+gcloud ai-platform models create $MODEL_NAME --regions=$REGION
+
+gsutil ls -r $OUTPUT_PATH/export
+
+MODEL_BINARIES=$OUTPUT_PATH/export/census/1585323712/
+gcloud ai-platform versions create v1 \
+--model $MODEL_NAME \
+--origin $MODEL_BINARIES \
+--runtime-version 1.14 \
+--python-version 3.5
+
+
