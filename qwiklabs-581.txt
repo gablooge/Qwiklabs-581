@@ -507,11 +507,12 @@ gcloud ai-platform jobs submit training $JOB_NAME \
 MODEL_NAME=census
 gcloud ai-platform models create $MODEL_NAME --regions=$REGION
 
-gsutil ls -r $OUTPUT_PATH/export
 
+git clone https://github.com/gablooge/Qwiklabs-581.git
+cd Qwiklabs-581
+gsutil cp -r testing $OUTPUT_PATH
 
-
-MODEL_BINARIES=$OUTPUT_PATH/export/census/1585325699/
+MODEL_BINARIES=$OUTPUT_PATH/testing/
 gcloud ai-platform versions create v1 \
 --model $MODEL_NAME \
 --origin $MODEL_BINARIES \
